@@ -5,8 +5,9 @@ use nom::{
     sequence::{delimited, preceded, terminated, tuple},
     IResult,
 };
-use rocket::routes;
-use sqlx::SqlitePool;
+use rocket::{State, http::Status, routes, serde::json::Json};
+use serde::Serialize;
+use sqlx::{FromRow, SqlitePool};
 use std::{
     io::{BufRead, BufReader},
     mem,
@@ -57,7 +58,7 @@ fn try_field_i32(line: &str, id: &'static str, field: &mut Option<i32>) {
     }
 }
 
-fn read_p1() {
+fn read_p1(db_pool: SqlitePool) {
     let serial = serialport::new("/dev/ttyUSB0", 9600)
         .timeout(Duration::from_secs(15))
         .data_bits(serialport::DataBits::Seven)
@@ -91,8 +92,8 @@ fn read_p1() {
         });
 
     for frame in frames {
+        let db_pool = db_pool.clone();
         rocket::tokio::task::spawn(async move {
-            let conn = SqlitePool::connect_lazy("sqlite://./dev.db").unwrap();
             let now = chrono::Utc::now().timestamp();
 
             sqlx::query!(
@@ -108,7 +109,7 @@ fn read_p1() {
                 frame.max_power,
                 frame.switch_mode,
             )
-                .execute(&conn)
+                .execute(&db_pool)
                 .await
                 .expect("insert into db");
 
@@ -117,14 +118,95 @@ fn read_p1() {
     }
 }
 
-#[rocket::get("/")]
-fn index() -> &'static str {
-    "hi"
+#[derive(FromRow)]
+struct Record {
+    timestamp: i64,
+    delivered_1: Option<f32>,
+    delivered_2: Option<f32>,
+}
+
+impl Record {
+    pub fn watts_since(&self, other: &Record) -> f32 {
+        let mut sorted = [self, other];
+        sorted.sort_by_key(|r| r.timestamp);
+        let [ min, max ] = sorted;
+
+        (max.delivered_2.unwrap() - min.delivered_2.unwrap()) * 3600.0 / (max.timestamp - min.timestamp) as f32 * 1000.0
+    }
+}
+
+#[rocket::get("/loadavg")]
+async fn loadavg(db_pool: &State<SqlitePool>) -> Result<String, (Status, String)> {
+    let now = chrono::Utc::now().timestamp();
+
+    let res = sqlx::query_as!(
+            Record,
+            "SELECT timestamp, delivered_1, delivered_2 FROM records WHERE timestamp > ? - 15 * 60 - 10",
+            now
+        )
+        .fetch_all(db_pool.inner())
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    if res.is_empty() {
+        return Err((Status::InternalServerError, "no records".to_owned()));
+    }
+
+    let min_15_start = res.iter().min_by_key(|r| r.timestamp).unwrap();
+    let min_5_start = res.iter().filter(|r| r.timestamp > now - 5 * 60 - 10).min_by_key(|r| r.timestamp).unwrap();
+    let min_1_start = res.iter().filter(|r| r.timestamp > now - 1 * 60 - 10).min_by_key(|r| r.timestamp).unwrap();
+    let end = res.last().unwrap();
+
+    Ok(format!(
+        "{:.0}, {:.0}, {:.0}",
+        end.watts_since(min_1_start),
+        end.watts_since(min_5_start),
+        end.watts_since(min_15_start),
+    ))
+}
+
+#[derive(Serialize)]
+struct ValuesResponse {
+    timestamp: i64,
+    delivered_1: Option<f32>,
+    delivered_2: Option<f32>,
+    current_tariff: Option<i64>,
+}
+
+#[rocket::get("/values?<from>&<to>")]
+async fn values(
+    from: Option<i64>,
+    to: Option<i64>,
+    db_pool: &State<SqlitePool>,
+) -> Result<Json<Vec<ValuesResponse>>, (Status, String)> {
+    let (from, to) = if let (Some(from), Some(to)) = (from, to) { (from, to) }
+    else {
+        return Err((Status::BadRequest, "`from` and `to` query parameters are required".to_owned()));
+    };
+
+    let res = sqlx::query_as!(
+            ValuesResponse,
+            "SELECT timestamp, delivered_1, delivered_2, current_tariff FROM records WHERE timestamp BETWEEN ? AND ?",
+            from,
+            to,
+        )
+        .fetch_all(db_pool.inner())
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    Ok(Json(res))
 }
 
 #[rocket::launch]
 async fn rocket() -> _ {
-    rocket::tokio::task::spawn_blocking(read_p1);
+    let db_pool = SqlitePool::connect_lazy("sqlite://./dev.db").unwrap();
 
-    rocket::build().mount("/", routes![index])
+    rocket::tokio::task::spawn_blocking({
+        let db_pool = db_pool.clone();
+        move || read_p1(db_pool)
+    });
+
+    rocket::build()
+        .manage(db_pool)
+        .mount("/", routes![ values, loadavg ])
 }
